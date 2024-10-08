@@ -5,7 +5,7 @@ config = {
     'author': "Aaron O'Leary",
     'url': 'http://github.com/aaren/wavelets',
     'author_email': 'eeaol@leeds.ac.uk',
-    'version': '0.11',
+    'version': '1.00',
     'packages': ['wavelets'],
     'name': 'wavelets',
     'setup_requires': ['numpy'],

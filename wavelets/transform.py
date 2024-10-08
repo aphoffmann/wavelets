@@ -247,6 +247,7 @@ class WaveletTransform:
         self.unbias = unbias
         self.mask_coi = mask_coi
         self.axis = axis
+        self.lowest_freq = None 
 
     @property
     def fourier_period(self):
@@ -351,8 +352,15 @@ class WaveletTransform:
         # Fourier period is approximately 2dt
         s0 = self.s0
 
-        # Largest scale
-        J = int((1 / dj) * np.log2(self.N * dt / s0))
+        # Calculate the maximum scale corresponding to desired frequency
+        if(self.lowest_freq != None):
+            desired_low_freq = self.lowest_freq  # e.g., 0.05 Hz
+            s_max = self.wavelet.w0 / (2 * np.pi * desired_low_freq)
+
+            # Calculate the number of scales J
+            J = int(np.ceil(np.log2(s_max / s0) / dj))
+        else:
+            J = int((1/dj) * np.log2(self.N * dt / s0))
 
         sj = s0 * 2 ** (dj * np.arange(0, J + 1))
         return sj
@@ -436,7 +444,7 @@ class WaveletTransform:
         # add the mean back on (x_n is anomaly time series)
         x_n += self.data.mean(axis=self.axis, keepdims=True)
 
-        return x_n
+        return x_n.real
 
     @property
     def global_wavelet_spectrum(self):

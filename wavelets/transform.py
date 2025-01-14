@@ -1,618 +1,342 @@
 import numpy as np
 import scipy
-import scipy.signal
 import scipy.optimize
-import scipy.special
-import scipy.fft
 
 from .wavelets import Morlet
 
-__all__ = ['cwt', 'WaveletAnalysis', 'WaveletTransform']
+__all__ = [
+    'WaveletTransform',
+    'WaveletAnalysis',
+    'grid_based_wavelet_transform',
+    'inverse_grid_based_wavelet_transform',
+    'auto_choose_grid_params'
+]
 
 
-def cwt(data, wavelet=None, widths=None, dt=1, frequency=False, axis=-1):
-    """Continuous wavelet transform using the Fourier transform
-    convolution as used in Terrence and Compo.
+def grid_based_wavelet_transform(
+    data,
+    wavelet,
+    d=1.0,
+    b=2.0,
+    q=1.0,
+    j_min=0,
+    j_max=128,
+    alpha_for_delta=1.61803,
+    xi_1=0.25,
+    use_compensation=False
+):
+    """
+    Compute the grid-based decimation wavelet transform, supporting:
 
-    (as opposed to the direct convolution method used by
-    scipy.signal.cwt)
-
-    *This method is over 10x faster than the scipy default.*
-
-    Performs a continuous wavelet transform on `data`,
-    using the `wavelet` function. A CWT performs a convolution
-    with `data` using the `wavelet` function, which is characterized
-    by a width parameter and length parameter.
+    1) Negative j indices (j_min < 0).
+    2) Compensation (Equation (4)) or standard mode (Equation (5)).
 
     Parameters
     ----------
-    data : (N,) ndarray
-        data on which to perform the transform.
-
-    wavelet : function
-        Wavelet function in either time or frequency space, which
-        should take 2 arguments. If the wavelet is frequency based,
-        frequency must be set to True.
-
-        The first parameter is time or frequency.
-
-        The second is a width parameter, defining the size of the wavelet
-        (e.g. standard deviation of a Gaussian).
-
-        The wavelet function, Y, should be such that
-        Int[-inf][inf](|Y|^2) = 1
-
-        It is then multiplied here by a normalisation factor,
-        which gives it unit energy.
-
-        In the time domain, the normalisation factor is
-
-            (s / dt)
-
-        In the frequency domain, the normalisation factor is
-
-            (2 * pi * dt / s) ^ (1/2),
-
-    widths : (M,) sequence
-        Widths to use for transform.
-
-    dt: float
-        sample spacing. defaults to 1 (data sample units).
-
-    frequency: boolean. Whether the wavelet function is one of
-               time or frequency. Default, False, is for a time
-               representation of the wavelet function.
-
-    axis: int, the axis in the data over which to perform the 1D
-          transform (default 0)
+    data : 1D ndarray
+        The signal to transform.
+    wavelet : wavelet object
+        Must have .grid_time_eq4(...) and .grid_time_eq5(...) methods 
+        (or a single method that can handle both).
+    d, b, q : float
+        Decimation factor, base scale, and frequency step.
+    j_min, j_max : int
+        Range of j. The code will loop j = [j_min, j_min+1, ..., j_max-1].
+    alpha_for_delta : float
+        Kronecker multiplier for channel-specific delay, δ_j = frac(alpha_for_delta * j).
+    xi_1 : float
+        Frequency modulation factor used if use_compensation=False (Eq. (5)).
+    use_compensation : bool
+        If True, use Eq. (4): 
+            ψ_{l,j}(t) = sqrt(1/b + j/q) * ψ((1/b + j/q)*(t - d(l+δ_j))).
+        If False, use Eq. (5):
+            ψ_{l,j}(t) = (1/sqrt(b)) * ψ((t - d(l+δ_j))/b) * exp(2π i xi_1 * j*(t - ...)/q).
 
     Returns
     -------
-    cwt: (M, N) ndarray
-        Will have shape of (len(data), len(widths)).
-
+    W : 2D ndarray of shape (num_l, num_j_total)
+        Wavelet coefficients: W[l, j_index], 
+        where j_index runs from 0..(j_max - j_min - 1).
+    j_values : ndarray
+        The actual j-values used (from j_min..j_max-1).
     """
-    if widths is None:
-        raise UserWarning('Have to specify some widths (scales)')
+    data = np.asarray(data)
+    n_data = data.size
 
-    if not wavelet:
-        raise UserWarning('Have to specify a wavelet function')
+    # We'll interpret l in [0..num_l-1], but we won't fix it here:
+    # Instead, let num_l match the data length or something else.
+    # For demonstration, let:
+    num_l = len(data)
 
-    if frequency:
-        return cwt_freq(data, wavelet, widths, dt, axis)
-    elif not frequency:
-        return cwt_time(data, wavelet, widths, dt, axis)
+    # Construct array of j values, e.g. j_min=-2, j_max=128
+    j_values = np.arange(j_min, j_max)
+    num_j = len(j_values)
+
+    # Precompute the delays for each j
+    delta_vals = np.mod(alpha_for_delta * j_values, 1.0)
+
+    # Prepare the output
+    W = np.zeros((num_l, num_j), dtype=complex)
+
+    tvals = np.arange(n_data)
+
+    for j_idx, j_val in enumerate(j_values):
+        # For negative j, eq. (3) still says s_j = 1 / (b^-1 + q^-1 * j_val)
+        # or eq. (4) has alpha_j = (1/b + j_val/q).
+        # If this is <= 0, skip or zero out (no wavelet).
+        alpha_j = (1.0 / b) + (j_val / q)
+
+        # Avoid alpha_j <= 0 => no meaningful wavelet scale.
+        if alpha_j <= 0:
+            continue
+
+        delta_j = delta_vals[j_idx]
+
+        for l in range(num_l):
+            if use_compensation:
+                # Use eq. (4) style wavelet
+                psi_l_j = wavelet.grid_time_eq4(
+                    tvals, l, j_val, d, b, q, delta_j
+                )
+            else:
+                # Use eq. (5) style wavelet
+                psi_l_j = wavelet.grid_time_eq5(
+                    tvals, l, j_val, d, b, q, delta_j, xi_1
+                )
+            W[l, j_idx] = np.sum(data * np.conjugate(psi_l_j))
+
+    return W, j_values
 
 
-def cwt_time(data, wavelet, widths, dt, axis):
-    # wavelets can be complex so output is complex
-    output = np.zeros((len(widths),) + data.shape, dtype=complex)
+def inverse_grid_based_wavelet_transform(
+    W,
+    j_values,
+    wavelet,
+    data_length,
+    d=1.0,
+    b=2.0,
+    q=1.0,
+    alpha_for_delta=1.61803,
+    xi_1=0.25,
+    use_compensation=False,
+    normalization=1.0
+):
+    """
+    Naïve inverse, summing W[l, j] * ψ_{l,j}(t) over l,j.
 
-    # compute in time
-    slices = [None for _ in data.shape]
-    slices[axis] = slice(None)
-    slices = tuple(slices)
-    for ind, width in enumerate(widths):
-        # number of points needed to capture wavelet
-        M = 10 * width / dt
-        # times to use, centred at zero
-        t = np.arange((-M + 1) / 2., (M + 1) / 2.) * dt
-        # sample wavelet and normalise
-        norm = (dt / width) ** .5
-        wavelet_data = norm * wavelet(t, width)
-        output[ind, :] = scipy.signal.fftconvolve(data,
-                                                  wavelet_data[slices],
-                                                  mode='same')
-    return output
+    If use_compensation=True, uses Eq. (4). If False, uses Eq. (5).
+    Adjust 'normalization' to tune amplitude.
+
+    Parameters
+    ----------
+    W : ndarray of shape (num_l, num_j)
+    j_values : ndarray
+        The actual j-values used in the forward transform.
+    wavelet : wavelet object
+        Must have the same .grid_time_eq4 or eq5 used in forward transform.
+    data_length : int
+        Length of the reconstructed signal.
+    d, b, q : float
+    alpha_for_delta : float
+    xi_1 : float
+    use_compensation : bool
+        Use Eq. (4) vs Eq. (5).
+    normalization : float
+        Global factor for amplitude.
+
+    Returns
+    -------
+    data_approx : 1D ndarray (real)
+    """
+    data_approx = np.zeros(data_length, dtype=complex)
+    num_l, num_j = W.shape
+    tvals = np.arange(data_length)
+
+    for j_idx, j_val in enumerate(j_values):
+        alpha_j = (1.0 / b) + (j_val / q)
+        # skip invalid alpha_j
+        if alpha_j <= 0:
+            continue
+
+        delta_j = np.mod(alpha_for_delta * j_val, 1.0)
+
+        for l in range(num_l):
+            if use_compensation:
+                psi_l_j_t = wavelet.grid_time_eq4(
+                    tvals, l, j_val, d, b, q, delta_j
+                )
+            else:
+                psi_l_j_t = wavelet.grid_time_eq5(
+                    tvals, l, j_val, d, b, q, delta_j, xi_1
+                )
+            data_approx += W[l, j_idx] * psi_l_j_t
+
+    data_approx *= normalization
+    return data_approx.real
 
 
-def cwt_freq(data, wavelet, widths, dt, axis):
-    # compute in frequency
-    # next highest power of two for padding
-    N = data.shape[axis]
-    pN = int(2 ** np.ceil(np.log2(N)))
-    # N.B. padding in fft adds zeros to the *end* of the array,
-    # not equally either end.
-    fft_data = scipy.fft.fft(data, n=pN, axis=axis)
-    # frequencies
-    w_k = scipy.fft.fftfreq(pN, d=dt) * 2 * np.pi
+def auto_choose_grid_params(
+    data_length, sample_rate=1.0, M_C=0
+):
+    """
+    Simple heuristic picking parameters for grid-based decimation,
+    plus optional negative j coverage (M_C).
 
-    # sample wavelet and normalise
-    norm = (2 * np.pi * widths / dt) ** .5
-    wavelet_data = norm[:, None] * wavelet(w_k, widths[:, None])
+    Parameters
+    ----------
+    data_length : int
+    sample_rate : float
+    M_C : int
+        Number of 'compensation channels' => negative j from -M_C..-1.
 
-    # Convert negative axis. Add one to account for
-    # inclusion of widths axis above.
-    axis = (axis % data.ndim) + 1
+    Returns
+    -------
+    d, b, q, j_min, j_max, alpha_for_delta
+    """
+    dt = 1.0 / sample_rate
 
-    # perform the convolution in frequency space
-    slices = [slice(None)] + [None for _ in data.shape]
-    slices[axis] = slice(None)
-    slices = tuple(slices)
+    d = dt
+    b = 2.0
+    q = 1.0
 
-    out = scipy.fft.ifft(fft_data[None] * wavelet_data.conj()[slices],
-                         n=pN, axis=axis)
+    # j_min negative? For compensation channels, e.g. -M_C
+    j_min = -M_C
+    # j_max e.g. ~ log2(...) or a fixed default. We'll choose:
+    j_max = max(16, int(np.ceil(np.log2(data_length))))
 
-    # remove zero padding
-    slices = [slice(None) for _ in out.shape]
-    slices[axis] = slice(None, N)
-    slices = tuple(slices)
+    alpha_for_delta = 1.61803
 
-    if data.ndim == 1:
-        return out[slices].squeeze()
-    else:
-        return out[slices]
+    return d, b, q, j_min, j_max, alpha_for_delta
 
 
 class WaveletTransform:
     """
-    Sx.y are references to section x.y in Torrence and Compo,
-    A Practical Guide to Wavelet Analysis (BAMS, 1998)
-
-
-    ### Wavelet function requirements (S3.b) ###
-
-    To be admissible as a wavelet, a function must:
-
-    - have zero mean
-    - be localised in both time and frequency space
-
-    These functions are a function of a dimensionless time
-    parameter.
-
-    ### Function selection considerations (S3.e) ###
-
-    #### Complex / Real
-
-    A *complex* wavelet function will return information about both
-    amplitude and phase and is better adapted for capturing
-    *oscillatory behaviour*.
-
-    A *real* wavelet function returns only a single component and
-    can be used to isolate *peaks or discontinuities*.
-
-    ### Width
-
-    Define the width of a wavelet as the e-folding time of the
-    wavelet amplitude.
-
-    The resolution of the wavelet function is determined by the
-    balance between the width in real and Fourier space.
-
-    A narrow function in time will have good time resolution but
-    poor frequency resolution and vice versa.
-
-    ### Shape
-
-    The wavelet function should represent the type of features
-    present in the time series.
-
-    For time series with sharp jumps or steps, choose a boxcar-like
-    function such as Harr; while for smoothly varying time series,
-    choose something like a damped cosine.
-
-    The choice of wavelet function is not critical if one is only
-    qualitatively interested in the wavelet power spectrum.
-
-    ### Equivalent Fourier period (S3.h) ###
-
-    The peak wavelet response does not necessarily occur at 1 / s.
-
-    If we wish to compare wavelet spectra at different scales with
-    each other and with Fourier modes, we need a common set of
-    units.
-
-    The equivalent Fourier period is defined as where the wavelet
-    power spectrum reaches its maximum and can be found analytically.
+    Grid-Based Wavelet Transform with negative j and optional compensation.
     """
 
-    def __init__(self, data=None, time=None, dt=1,
-                 dj=0.125, wavelet=Morlet(), unbias=False,
-                 mask_coi=False, frequency=False, axis=-1):
-        """Arguments:
-            data - 1 dimensional input signal
-            time - corresponding times for the input signal
-                   not essential, but the COI will be calculated
-                   for time starting at zero.
-            dt - sample spacing
-            dj - scale resolution
-            wavelet - wavelet class to use, must have an attribute
-                      `time`, giving a wavelet function that takes (t, s)
-                      as arguments and, if frequency is True, an
-                      attribute `frequency`, giving a wavelet function
-                      that takes (w, s) as arguments.
-            unbias - boolean, whether to unbias the power spectrum, as
-                     in Liu et al. 2007 (default False)
-            frequency - boolean, compute the cwt in frequency space?
-                        (default False)
-            mask_coi - disregard wavelet power outside the cone of
-                       influence when computing global wavelet spectrum
-                       (default False)
-            axis - axis of the input data to transform over (default -1)
+    def __init__(self, data,
+                 wavelet=Morlet(),
+                 d=None, b=None, q=None,
+                 j_min=None, j_max=None,
+                 alpha_for_delta=None,
+                 xi_1=0.25,
+                 use_compensation=False,
+                 M_C=0,
+                 sample_rate=1.0):
         """
-        self.data = data
-        if time is None:
-            time = np.indices((data.shape[axis],)).squeeze() * dt
-        self.time = time
-        self.anomaly_data = self.data - self.data.mean(axis=axis,
-                                                       keepdims=True)
-        self.N = data.shape[axis]
-        self.data_variance = self.data.var(axis=axis, keepdims=True)
-        self.dt = dt
-        self.dj = dj
+        Parameters
+        ----------
+        data : 1D ndarray
+        wavelet : wavelet object
+            Must implement grid_time_eq4(...) and grid_time_eq5(...).
+        d, b, q : float
+            Grid parameters. If None, chosen automatically.
+        j_min, j_max : int
+            Range for j. If None, chosen automatically.
+        alpha_for_delta : float
+            Kronecker multiplier for δ_j. If None, defaults to golden ratio.
+        xi_1 : float
+            Phase factor for eq. (5).
+        use_compensation : bool
+            If True, use eq. (4). Otherwise eq. (5).
+        M_C : int
+            Number of negative j channels if j_min is not directly specified.
+        sample_rate : float
+            Used if d is chosen automatically (d=dt).
+        """
+        self.data = np.asarray(data)
         self.wavelet = wavelet
-        # which continuous wavelet transform to use
-        self.cwt = cwt
-        self.frequency = frequency
-        self.unbias = unbias
-        self.mask_coi = mask_coi
-        self.axis = axis
-        self.lowest_freq = None 
+        self.xi_1 = xi_1
+        self.use_compensation = use_compensation
+        self.sample_rate = sample_rate
+        self.M_C = M_C
 
-    @property
-    def fourier_period(self):
-        """Return a function that calculates the equivalent Fourier
-        period as a function of scale.
-        """
-        return getattr(self.wavelet, 'fourier_period')
+        # Auto-choose if needed
+        if any(par is None for par in [d, b, q, j_min, j_max, alpha_for_delta]):
+            auto = auto_choose_grid_params(
+                data_length=len(data),
+                sample_rate=sample_rate,
+                M_C=M_C
+            )
+            d_auto, b_auto, q_auto, jmin_auto, jmax_auto, alpha_auto = auto
 
-    @property
-    def scale_from_period(self):
-        """Return a function that calculates the wavelet scale
-        from the fourier period
-        """
-        return getattr(self.wavelet, 'scale_from_period')
-
-    @property
-    def fourier_periods(self):
-        """Return the equivalent Fourier periods for the scales used."""
-        return self.fourier_period(self.scales)
-
-    @fourier_periods.setter
-    def fourier_periods(self, periods):
-        """Set the scales based on a list of fourier periods"""
-        self.scales = self.wavelet.scale_from_period(periods)
-
-    @property
-    def fourier_frequencies(self):
-        """
-        Return the equivalent frequencies .
-        This is equivalent to 1.0 / self.fourier_periods
-        """
-        return np.reciprocal(self.fourier_periods)
-
-    @fourier_frequencies.setter
-    def fourier_frequencies(self, frequencies):
-        """
-        Set the scales based on a list of fourier periods.
-        This is equivalent to self.fourier_periods = 1.0 / frequencies
-        """
-        self.fourier_periods = np.reciprocal(frequencies)
-
-    @property
-    def s0(self):
-        if not hasattr(self, '_s0'):
-            return self.find_s0()
+            self.d = d if d is not None else d_auto
+            self.b = b if b is not None else b_auto
+            self.q = q if q is not None else q_auto
+            self.j_min = j_min if j_min is not None else jmin_auto
+            self.j_max = j_max if j_max is not None else jmax_auto
+            self.alpha_for_delta = alpha_for_delta if alpha_for_delta is not None else alpha_auto
         else:
-            return self._s0
+            self.d = d
+            self.b = b
+            self.q = q
+            self.j_min = j_min
+            self.j_max = j_max
+            self.alpha_for_delta = alpha_for_delta
 
-    @s0.setter
-    def s0(self, value):
-        setattr(self, '_s0', value)
-
-    def find_s0(self):
-        """Find the smallest resolvable scale by finding where the
-        equivalent Fourier period is equal to 2 * dt. For a Morlet
-        wavelet, this is roughly 1.
-        """
-        dt = self.dt
-
-        def f(s):
-            return self.fourier_period(s) - 2 * dt
-        return scipy.optimize.fsolve(f, 1)[0]
-
-    @property
-    def scales(self):
-        if not hasattr(self, '_scales'):
-            return self.compute_optimal_scales()
-        else:
-            return self._scales
-
-    @scales.setter
-    def scales(self, value):
-        setattr(self, '_scales', value)
-
-    def compute_optimal_scales(self):
-        """Form a set of scales to use in the wavelet transform.
-
-        For non-orthogonal wavelet analysis, one can use an
-        arbitrary set of scales.
-
-        It is convenient to write the scales as fractional powers of
-        two:
-
-            s_j = s_0 * 2 ** (j * dj), j = 0, 1, ..., J
-
-            J = (1 / dj) * log2(N * dt / s_0)
-
-        s0 - smallest resolvable scale
-        J - largest scale
-
-        choose s0 so that the equivalent Fourier period is 2 * dt.
-
-        The choice of dj depends on the width in spectral space of
-        the wavelet function. For the Morlet, dj=0.5 is the largest
-        that still adequately samples scale. Smaller dj gives finer
-        scale resolution.
-        """
-        dt = self.dt
-        # resolution
-        dj = self.dj
-        # smallest resolvable scale, chosen so that the equivalent
-        # Fourier period is approximately 2dt
-        s0 = self.s0
-
-        # Calculate the maximum scale corresponding to desired frequency
-        if(self.lowest_freq != None):
-            desired_low_freq = self.lowest_freq  # e.g., 0.05 Hz
-            s_max = self.wavelet.w0 / (2 * np.pi * desired_low_freq)
-
-            # Calculate the number of scales J
-            J = int(np.ceil(np.log2(s_max / s0) / dj))
-        else:
-            J = int((1/dj) * np.log2(self.N * dt / s0))
-
-        sj = s0 * 2 ** (dj * np.arange(0, J + 1))
-        return sj
-
-    @property
-    def w_k(self):
-        """Angular frequency as a function of Fourier index.
-
-        See eq5 of TC.
-
-        N.B the frequencies returned by numpy are adimensional, on
-        the interval [-1/2, 1/2], so we multiply by 2 * pi.
-        """
-        return 2 * np.pi * scipy.fft.fftfreq(self.N, self.dt)
+        self._W = None
+        self._j_values = None
 
     @property
     def wavelet_transform(self):
-        """Calculate the wavelet transform."""
-        widths = self.scales
+        """Compute the forward transform (W, j_values) once and cache it."""
+        if self._W is None:
+            W, jvals = grid_based_wavelet_transform(
+                data=self.data,
+                wavelet=self.wavelet,
+                d=self.d,
+                b=self.b,
+                q=self.q,
+                j_min=self.j_min,
+                j_max=self.j_max,
+                alpha_for_delta=self.alpha_for_delta,
+                xi_1=self.xi_1,
+                use_compensation=self.use_compensation
+            )
+            self._W = W
+            self._j_values = jvals
+        return self._W
 
-        if self.frequency:
-            wavelet = self.wavelet.frequency
-        else:
-            wavelet = self.wavelet.time
+    @property
+    def j_values(self):
+        """Return the array of j-values used in the transform."""
+        if self._j_values is None:
+            _ = self.wavelet_transform
+        return self._j_values
 
-        return self.cwt(self.anomaly_data,
-                        wavelet=wavelet,
-                        widths=widths,
-                        dt=self.dt,
-                        frequency=self.frequency,
-                        axis=self.axis)
+    def inverse_transform(self, normalization=1.0):
+        """
+        Reconstruct (naïve) from W[l,j], summing over l,j using eq. (4) or eq. (5).
+
+        Parameters
+        ----------
+        normalization : float
+            Overall amplitude scale factor.
+
+        Returns
+        -------
+        data_approx : 1D ndarray (real)
+        """
+        if self._W is None:
+            _ = self.wavelet_transform  # force compute
+        data_approx = inverse_grid_based_wavelet_transform(
+            W=self._W,
+            j_values=self._j_values,
+            wavelet=self.wavelet,
+            data_length=len(self.data),
+            d=self.d,
+            b=self.b,
+            q=self.q,
+            alpha_for_delta=self.alpha_for_delta,
+            xi_1=self.xi_1,
+            use_compensation=self.use_compensation,
+            normalization=normalization
+        )
+        return data_approx
 
     @property
     def wavelet_power(self):
-        """Calculate the wavelet power spectrum, optionally using
-        the bias correction factor introduced by Liu et al. 2007,
-        which is to divide by the scale.
-        """
-        if self.unbias:
-            return (np.abs(self.wavelet_transform).T ** 2 / self.scales).T
-        elif not self.unbias:
-            return np.abs(self.wavelet_transform) ** 2
-
-    def reconstruction(self, scales=None):
-        """Reconstruct the original signal from the wavelet
-        transform. See S3.i.
-
-        For non-orthogonal wavelet functions, it is possible to
-        reconstruct the original time series using an arbitrary
-        wavelet function. The simplest is to use a delta function.
-
-        The reconstructed time series is found as the sum of the
-        real part of the wavelet transform over all scales,
-
-        x_n = (dj * dt^(1/2)) / (C_d * Y_0(0)) \
-                * Sum_(j=0)^J { Re(W_n(s_j)) / s_j^(1/2) }
-
-        where the factor C_d comes from the reconstruction of a delta
-        function from its wavelet transform using the wavelet
-        function Y_0. This C_d is a constant for each wavelet
-        function.
-        """
-        dj = self.dj
-        dt = self.dt
-        C_d = self.C_d
-        Y_00 = self.wavelet.time(0)
-        if scales is not None:
-            old_scales = self.scales
-            self.scales = scales
-
-        s = self.scales
-        W_n = self.wavelet_transform
-
-        if scales is not None:
-            self.scales = old_scales
-
-        # use the transpose to allow broadcasting
-        real_sum = np.sum(W_n.real.T / s ** .5, axis=-1).T
-        x_n = real_sum * (dj * dt ** .5 / (C_d * Y_00))
-
-        # add the mean back on (x_n is anomaly time series)
-        x_n += self.data.mean(axis=self.axis, keepdims=True)
-
-        return x_n.real
-
-    @property
-    def global_wavelet_spectrum(self):
-        if not self.mask_coi:
-            mean_power = np.mean(self.wavelet_power, axis=1)
-        elif self.mask_coi:
-            mean_power = self.coi_mean(self.wavelet_power, axis=1)
-        var = self.data_variance
-        return mean_power / var
-
-    def coi_mean(self, arr, axis=1):
-        """Calculate a mean, but only over times within the cone of
-        influence.
-
-        Implement so can replace np.mean(wavelet_power, axis=1)
-        """
-        # TODO: consider applying upstream, inside wavelet_power
-        coi = self.wavelet.coi
-        s = self.scales
-        t = self.time
-        T, S = np.meshgrid(t, s)
-        inside_coi = (coi(S) < T) & (T < (T.max() - coi(S)))
-        mask_power = np.ma.masked_where(~inside_coi, self.wavelet_power)
-        mask_mean = np.mean(mask_power, axis=axis)
-        return mask_mean
-
-    @property
-    def C_d(self):
-        """Constant used in reconstruction of data from delta
-        wavelet function. See self.reconstruction and S3.i.
-
-        To derive C_d for a new wavelet function, first assume a
-        time series with a delta function at time n=0, given by x_n
-        = d_n0. This time series has a Fourier transform x_k = 1 /
-        N, constant over k.
-
-        Substituting x_k into eq4 at n=0 (the peak of the delta
-        function), the wavelet transform becomes
-
-            W_d(s) = (1 / N) Sum[k=0][N-1] { Y'*(s, w_k) }
-
-        The reconstruction then gives
-
-            C_d = (dj * dt^(1/2)) / Y_0(0) \
-                    * Sum_(j=0)^J { Re(W_d(s_j)) / s_j^(1/2) }
-
-        C_d is scale independent and a constant for each wavelet
-        function.
-        """
-        if hasattr(self.wavelet, 'C_d'):
-            return self.wavelet.C_d
-        else:
-            return self.compute_Cdelta()
-
-    def compute_Cdelta(self):
-        """Compute the parameter C_delta (see self.C_d), used in
-        reconstruction. See section 3.i of TC98.
-
-        FIXME: this doesn't work. TC98 gives 0.776 for the Morlet
-        wavelet with dj=0.125.
-        """
-        dj = self.dj
-        dt = self.dt
-        s = self.scales
-        W_d = self.wavelet_transform_delta
-
-        # value of the wavelet function at t=0
-        Y_00 = self.wavelet.time(0)
-
-        real_sum = np.sum(W_d.real / s ** .5)
-        C_d = real_sum * (dj * dt ** .5 / Y_00)
-        return C_d
-
-    @property
-    def wavelet_transform_delta(self):
-        """Calculate the delta wavelet transform.
-
-        Returns an array of the transform computed over the scales.
-        """
-        Y_0 = self.wavelet.frequency  # wavelet as f(w_k, s)
-
-        WK, S = np.meshgrid(self.w_k, self.scales)
-
-        # compute Y_ over all s, w_k and sum over k
-        norm = (2 * np.pi * S / self.dt) ** .5
-        W_d = (1 / self.N) * np.sum(norm * Y_0(WK, S), axis=1)
-
-        # N.B This W_d is 1D (defined only at n=0)
-        return W_d
-
-    @property
-    def wavelet_variance(self):
-        """Equivalent of Parseval's theorem for wavelets, S3.i.
-
-        The wavelet transform conserves total energy, i.e. variance.
-
-        Returns the variance of the input data.
-        """
-        # TODO: mask COI for calculation of wavelet_variance
-        # is this possible? how does it change the factors?
-        dj = self.dj
-        dt = self.dt
-        C_d = self.C_d
-        N = self.N
-        s = np.expand_dims(self.scales, 1)
-
-        A = dj * dt / (C_d * N)
-
-        var = A * np.sum(np.abs(self.wavelet_transform) ** 2 / s)
-
-        return var
-
-    @property
-    def coi(self):
-        """The Cone of Influence is the region near the edges of the
-        input signal in which edge effects may be important.
-
-        Return a tuple (T, S) that describes the edge of the cone
-        of influence as a single line in (time, scale).
-        """
-        Tmin = self.time.min()
-        Tmax = self.time.max()
-        Tmid = Tmin + (Tmax - Tmin) / 2
-        s = np.geomspace(self.scales.min(), self.scales.max(), 100)
-        c1 = Tmin + self.wavelet.coi(s)
-        c2 = Tmax - self.wavelet.coi(s)
-
-        C = np.hstack((c1[np.where(c1 < Tmid)], c2[np.where(c2 > Tmid)]))
-        S = np.hstack((s[np.where(c1 < Tmid)], s[np.where(c2 > Tmid)]))
-
-        # sort w.r.t time
-        iC = C.argsort()
-        sC = C[iC]
-        sS = S[iC]
-
-        return sC, sS
-
-    def plot_power(self, ax=None, coi=True):
-        """Create a basic wavelet power plot with time on the
-        x-axis, scale on the y-axis, and a cone of influence
-        overlaid.
-
-        Requires matplotlib.
-        """
-        import matplotlib.pyplot as plt
-
-        if not ax:
-            fig, ax = plt.subplots()
-
-        Time, Scale = np.meshgrid(self.time, self.scales)
-        ax.contourf(Time, Scale, self.wavelet_power, 100)
-
-        ax.set_yscale('log')
-        ax.grid(True)
-
-        if coi:
-            coi_time, coi_scale = self.coi
-            ax.fill_between(x=coi_time,
-                            y1=coi_scale,
-                            y2=self.scales.max(),
-                            color='gray',
-                            alpha=0.3)
-
-        ax.set_xlim(self.time.min(), self.time.max())
-
-        return ax
-
+        """Magnitude-squared of the transform coefficients."""
+        return np.abs(self.wavelet_transform) ** 2
 
 WaveletAnalysis = WaveletTransform
-
-# TODO: derive C_d for given wavelet

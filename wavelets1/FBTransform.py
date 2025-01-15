@@ -1,173 +1,193 @@
 import numpy as np
 import scipy.signal
 
-from .wavelets import Morlet
-
 __all__ = [
-    "auto_choose_grid_params",
     "FilterBankWaveletTransform",
+    "Morlet",
 ]
 
-def auto_choose_scales(data_length, dt, s0=None, dj=0.25):
+class Cauchy:
+    def __init__(self, alpha=300):
+        """
+        alpha : float
+            Parameter controlling the time-frequency concentration.
+            Higher alpha leads to higher Q-factor.
+        """
+        self.alpha = alpha
+
+    def __call__(self, t, s=1.0):
+        return self.time(t, s=s)
+
+    def time(self, t, s=1.0):
+        """
+        Time-domain Cauchy wavelet, centered at zero.
+
+        t is in seconds; s is dimensionless scale.
+        """
+        x = t / s
+        return (x + 1j)**(-(self.alpha + 1))
+
+    def grid_time_eq4(self, t, l, j, d, b, q, delta_j):
+        """
+        Eq. (4):
+
+        psi_{l,j}(t) = sqrt(1/b + j/q)* psi( (1/b + j/q)*(t - d(l+δ_j)) ).
+        """
+        alpha_j = (1.0 / b) + (j / q)
+        shift = d * (l + delta_j)
+        arg = alpha_j * (t - shift)
+        return np.sqrt(alpha_j) * self.time(arg, s=1.0)
+
+    def grid_time_eq5(self, t, l, j, d, b, q, delta_j, xi_1):
+        """
+        Eq. (5):
+
+        psi_{l,j}^comp(t) = (1/sqrt(b)) * psi((t - d(l+δ_j))/b)
+            * exp(2π i xi_1 * j*(t - d(l+δ_j)) / q).
+        """
+        shift = d * (l + delta_j)
+        tau = (t - shift) / b
+        phase = np.exp(2j * np.pi * xi_1 * j * (t - shift) / q)
+        return (1.0 / np.sqrt(b)) * self.time(tau, s=1.0) * phase
+
+###############################################################################
+# (1) Morlet wavelet with eq(4) and eq(5). 
+#     We'll store xi_1 internally, but eq(4) doesn't use it.
+###############################################################################
+class Morlet:
     """
-    Return a set of scales s_j = s0 * 2^(j * dj), for j=0..J.
-
-    J = (1/dj) * log2( (N*dt) / s0 )
-
-    data_length : int
-    dt : float
-    s0 : float or None, optional
-    dj : float
-         scale resolution in log2 space
+    Complex Morlet wavelet that implements both eq(4) and eq(5),
+    deciding which to use based on alpha_j > 0 or not.
     """
-    N = data_length
-    if s0 is None:
-        s0 = 2 * dt
-    J = int(np.ceil((1.0 / dj) * np.log2((N * dt) / s0)))
-    scales = s0 * 2.0 ** (dj * np.arange(0, J + 1))
-    return scales
 
-def auto_choose_grid_params_dyadic_scales(
-    data_length,
-    sample_rate=1.0,
-    M_C=0,
-    s0=None,
-    dj=0.25
-):
-    """
-    Pick dyadic scales s_j, then solve eq(3) => j = q*(1/s_j - 1/b).
+    def __init__(self, w0=6, xi_1=0.25):
+        """
+        w0  : float, nondimensional frequency constant (~6 recommended).
+        xi_1: float, center frequency factor used in eq(5).
+        """
+        self.w0 = w0
+        self.xi_1 = xi_1
 
-    The final j_min, j_max, etc. are deduce from that set, plus negative j from M_C.
-    """
-    dt = 1.0 / sample_rate
-    d = dt      # decimation factor in seconds
-    b = 2.0
-    q = 1.0
+    def __call__(self, t, s=1.0, complete=True):
+        return self.time(t, s=s, complete=complete)
 
-    scales = auto_choose_scales(data_length, dt, s0=s0, dj=dj)
-    j_vals = []
+    def time(self, t, s=1.0, complete=False):
+        """
+        Standard Morlet time-domain wavelet for dimensionless scale s,
+        with center frequency w0. 
+        t is in seconds if dt is handled externally.
+        """
+        w = self.w0
+        x = t / s
+        out = np.exp(1j * w * x)
+        if complete:
+            out -= np.exp(-0.5 * (w ** 2))
+        out *= np.exp(-0.5 * (x ** 2)) * np.pi ** (-0.25)
+        return out
 
-    for s_j in scales:
-        alpha_j = (1.0 / s_j)
-        j_float = q * (alpha_j - (1.0 / b))
-        j_int = int(round(j_float))
-        if j_int not in j_vals:
-            j_vals.append(j_int)
+    def eq4_main_scale(self, t, l, j, d, b, q, delta_j):
+        """
+        Eq.(4) for alpha_j > 0:
+          psi_{l,j}(t) = sqrt(1/b + j/q)* psi( [1/b + j/q]*( t - d(l+δ_j)) ).
+        """
+        alpha_j = (1.0 / b) + (j / q)
+        shift = d * (l + delta_j)   
+        arg = alpha_j * (t - shift) 
+        base = self.time(arg, s=1.0, complete=True)
+        return np.sqrt(alpha_j) * base
 
-    # negative coverage
-    for neg_j in range(-M_C, 0):
-        if neg_j not in j_vals:
-            j_vals.append(neg_j)
-
-    j_vals = np.array(sorted(j_vals))
-    alpha_for_delta = 1.61803
-
-    j_min = j_vals.min()
-    j_max = j_vals.max() + 1
-    return d, b, q, j_min, j_max, alpha_for_delta, j_vals
-
-def auto_choose_grid_params(data_length, sample_rate=1.0, M_C=0,
-                            s0=None, dj=0.25):
-    """
-    Incorporate the dyadic-scale approach to build j-values,
-    then return (d,b,q,j_min,j_max,alpha_for_delta,j_vals).
-    """
-    d, b, q, j_min, j_max, alpha_for_delta, j_vals = \
-        auto_choose_grid_params_dyadic_scales(
-            data_length=data_length,
-            sample_rate=sample_rate,
-            M_C=M_C,
-            s0=s0,
-            dj=dj
+    def eq5_compensation(self, t, l, j, d, b, q, delta_j):
+        """
+        Eq.(5) for alpha_j <= 0 => "compensation" wavelet:
+          psi_{l,j}^comp(t) = (1/sqrt(b)) * psi((t - d(l+δ_j))/b)
+                              * exp(2π i xi_1 * j*(t - d(l+δ_j))/q).
+        """
+        shift = d * (l + delta_j)
+        tau = (t - shift) / b
+        base = self.time(tau, s=1.0, complete=False)
+        phase = np.exp(
+            2j * np.pi * self.xi_1 * j * (t - shift) / q
         )
-    return d, b, q, j_min, j_max, alpha_for_delta, j_vals
+        return (1.0 / np.sqrt(b)) * base * phase
 
+###############################################################################
+# (2) Build analysis filters with piecewise logic for eq(4)/(5)
+###############################################################################
 def _build_analysis_filter(
     wavelet,
     j_val,
-    d,
-    b,
-    q,
+    d, b, q,
     alpha,
-    xi_1,
-    use_compensation,
     sample_rate,
-    kernel_size
+    kernel_size,
+    l_val=0
 ):
     """
-    Build the 'analysis' filter h_j for channel j_val,
-    skipping if alpha_j <=0.
+    For channel j_val, we do:
+      - eq(4) if alpha_j > 0
+      - eq(5) if alpha_j <= 0
+    and then conj(reversed) to build the analysis filter.
     """
-    alpha_j = (1.0 / b) + (j_val / q)
-    if alpha_j <= 0:
-        return None
-
     dt = 1.0 / sample_rate
     half = kernel_size // 2
     t = (np.arange(kernel_size) - half) * dt
+
     delta_j = np.mod(alpha * j_val, 1.0)
+    alpha_j = (1.0 / b) + (j_val / q)
 
-    if use_compensation:
-        wav = wavelet.grid_time_eq4(t, 0, j_val, d, b, q, delta_j)
+    # Decide eq(4) vs eq(5)
+    if alpha_j > 0:
+        wav = wavelet.eq4_main_scale(t, l_val, j_val, d, b, q, delta_j)
     else:
-        wav = wavelet.grid_time_eq5(t, 0, j_val, d, b, q, delta_j, xi_1)
+        wav = wavelet.eq5_compensation(t, l_val, j_val, d, b, q, delta_j)
 
-    # analysis filter => conj(reversed(wav))
+    # analysis => conj(reversed(wav))
     return np.conjugate(wav[::-1])
 
 def _build_all_analysis_filters(
     data_length,
     wavelet,
     sample_rate,
-    d,
-    b,
-    q,
-    j_min,
-    j_max,
+    d, b, q,
+    j_min, j_max,
     alpha_for_delta,
-    xi_1,
-    use_compensation,
     kernel_size
 ):
-    j_vals = np.arange(j_min, j_max)
+    j_vals = np.arange(j_min, j_max+1)
     filters = {}
     valid_js = []
+
     for j_val in j_vals:
         h_j = _build_analysis_filter(
-            wavelet, j_val, d, b, q,
-            alpha_for_delta, xi_1,
-            use_compensation, sample_rate,
-            kernel_size
+            wavelet=wavelet,
+            j_val=j_val,
+            d=d, b=b, q=q,
+            alpha=alpha_for_delta,
+            sample_rate=sample_rate,
+            kernel_size=kernel_size
         )
-        if h_j is not None:
-            filters[j_val] = h_j
-            valid_js.append(j_val)
+        filters[j_val] = h_j/data_length
+        valid_js.append(j_val)
 
     return filters, np.array(valid_js)
 
+###############################################################################
+# (3) Synthesis filters => multi-channel dual or naive
+###############################################################################
 def _build_gram_matrix(analysis_filters, j_values):
-    """
-    Multi-channel Gram matrix:
-       G[i,k] = <h_{j_i}, h_{j_k}> = sum_n h_{j_i}[n]* conj(h_{j_k}[n])
-    """
     num_j = len(j_values)
     G = np.zeros((num_j, num_j), dtype=complex)
     for i, j1 in enumerate(j_values):
         h1 = analysis_filters[j1]
         for k, j2 in enumerate(j_values):
             h2 = analysis_filters[j2]
-            G[i, k] = np.vdot(h1, h2)
+            G[i, k] = np.vdot(h1, h2)  # sum conj(h1)*h2
     return G
 
 def _build_multi_channel_dual(analysis_filters, j_values):
-    """
-    Full multi-channel dual:
-      G^-1_{i,k}, then g_{j_i} = sum_k [ G^-1_{i,k} * conj(h_{j_k}) ]
-    """
     G = _build_gram_matrix(analysis_filters, j_values)
     G_inv = np.linalg.inv(G)
     dual_filters = {}
-
     for i, j1 in enumerate(j_values):
         length = len(analysis_filters[j1])
         g1 = np.zeros(length, dtype=complex)
@@ -178,17 +198,19 @@ def _build_multi_channel_dual(analysis_filters, j_values):
         dual_filters[j1] = g1
     return dual_filters
 
-def build_synthesis_filters(
-    analysis_filters,
-    j_values,
-    use_multi_channel=True
-):
+def build_synthesis_filters(analysis_filters, j_values, use_multi_channel=True, dt=1.0):
     """
-    If use_multi_channel => invert Gram matrix across channels.
-    If not => naive per-channel dual.
+    If multi_channel => invert Gram => multi-channel dual
+    Else => naive => g_j = conj(h_j)/||h_j||^2
+    Then multiply by sqrt(dt) so the inverse transform can multiply partial sums
+    by 1/sqrt(dt).
     """
+    scale_factor = np.sqrt(dt)
     if use_multi_channel:
-        return _build_multi_channel_dual(analysis_filters, j_values)
+        dual_filters = _build_multi_channel_dual(analysis_filters, j_values)
+        for j_val in dual_filters:
+            dual_filters[j_val] *= scale_factor
+        return dual_filters
     else:
         dual_filters = {}
         for j_val, h_j in analysis_filters.items():
@@ -196,50 +218,50 @@ def build_synthesis_filters(
             if abs(norm_h) < 1e-14:
                 dual_filters[j_val] = np.zeros_like(h_j)
             else:
-                dual_filters[j_val] = np.conjugate(h_j) / norm_h
+                dual_filters[j_val] = (np.conjugate(h_j) / norm_h) * scale_factor
         return dual_filters
 
+###############################################################################
+# (4) FilterBankWaveletTransform => eq(4)/(5) piecewise, dt usage consistent
+###############################################################################
 class FilterBankWaveletTransform:
     """
-    Filter-bank style wavelet transform with multi-channel dual,
-    eq(4)/(5), negative j, dt corrections, optional zero-padding,
-    and *dyadic scale* logic from auto_choose_grid_params(...).
+    Filter-bank wavelet transform that uses eq(4) if alpha_j>0, eq(5) if alpha_j<=0,
+    ensuring we have "main scale" for positive j and "compensation" for negative j,
+    as the paper indicates. We do:
+
+      alpha_j = 1/b + j/q
+
+      if alpha_j > 0 => eq(4)
+      else           => eq(5)
+
+    We multiply by sqrt(dt) in the forward transform, 1/sqrt(dt) in the inverse,
+    keep wavelet's center freq internally if eq(5) is used, etc.
     """
 
     def __init__(
         self,
         data,
-        wavelet=Morlet(),
+        wavelet=Morlet(w0=6, xi_1=0.25),
         sample_rate=1.0,
-        d=None, b=None, q=None,
-        j_min=None, j_max=None,
-        alpha_for_delta=None,
-        xi_1=0.25,
-        use_compensation=False,
-        M_C=0,
+        d=1.0, b=2.0, q=1.0,
+        j_min=-1, j_max=16,
+        alpha_for_delta=1.61803,
         use_multi_channel_dual=True,
         kernel_size=256,
         zero_pad=0,
-        s0=None,
-        dj=0.25
     ):
         """
         data : 1D array
-        wavelet : wavelet with eq4/eq5
-        sample_rate : float => dt=1/sample_rate
-        d,b,q : float => grid params
-        j_min,j_max => range of j
-        alpha_for_delta => Kronecker multiplier
-        xi_1 => eq(5)
-        use_compensation => eq(4) if True, eq(5) if False
-        M_C => negative j coverage
-        use_multi_channel_dual => if True, invert Gram matrix for multi-channel dual
-        kernel_size => length of wavelet filter
-        zero_pad => integer # of samples to pad on each side
-        s0,dj => for dyadic scales if the user doesn't manually set (d,b,q,j_min,j_max)
+        wavelet: wavelet class implementing eq(4)/(5) piecewise.
+        sample_rate => dt=1/sample_rate
+        d,b,q => eq(3) grid parameters
+        j_min,j_max => freq channel range
+        alpha_for_delta => quasi-random offset
+        use_multi_channel_dual => invert Gram matrix for channels
+        kernel_size => wavelet filter length in samples
+        zero_pad => # of samples to pad
         """
-        # Possibly auto-choose j-values from a dyadic scale set
-        # if user hasn't specified j_min/j_max or d,b,q,alpha_for_delta
         self.data_original = np.asarray(data, dtype=float)
         self.zero_pad = zero_pad
         if zero_pad > 0:
@@ -250,40 +272,19 @@ class FilterBankWaveletTransform:
         self.wavelet = wavelet
         self.sample_rate = sample_rate
         self.dt = 1.0 / sample_rate
-        self.xi_1 = xi_1
-        self.use_compensation = use_compensation
         self.use_multi_channel_dual = use_multi_channel_dual
         self.kernel_size = kernel_size
-        self.s0 = s0
-        self.dj = dj
+
+        self.d = d   # in seconds
+        self.b = b   # dimensionless
+        self.q = q   # dimensionless
+        self.j_min = j_min
+        self.j_max = j_max
+        self.alpha_for_delta = alpha_for_delta
 
         N = len(self.data)
 
-        # If user didn't pass in all required grid params, pick them with dyadic logic
-        if any(x is None for x in [d, b, q, j_min, j_max, alpha_for_delta]):
-            d_a, b_a, q_a, jmin_a, jmax_a, alpha_a, j_vals_a = auto_choose_grid_params(
-                data_length=N,
-                sample_rate=sample_rate,
-                M_C=M_C,
-                s0=self.s0,
-                dj=self.dj
-            )
-            self.d = d if d is not None else d_a
-            self.b = b if b is not None else b_a
-            self.q = q if q is not None else q_a
-            self.j_min = j_min if j_min is not None else jmin_a
-            self.j_max = j_max if j_max is not None else jmax_a
-            self.alpha_for_delta = alpha_for_delta if alpha_for_delta is not None else alpha_a
-        else:
-            # user-specified
-            self.d = d
-            self.b = b
-            self.q = q
-            self.j_min = j_min
-            self.j_max = j_max
-            self.alpha_for_delta = alpha_for_delta
-
-        # Build analysis filters
+        # Build piecewise eq(4)/(5) analysis filters
         self.analysis_filters, self.j_values = _build_all_analysis_filters(
             data_length=N,
             wavelet=self.wavelet,
@@ -294,8 +295,6 @@ class FilterBankWaveletTransform:
             j_min=self.j_min,
             j_max=self.j_max,
             alpha_for_delta=self.alpha_for_delta,
-            xi_1=self.xi_1,
-            use_compensation=self.use_compensation,
             kernel_size=self.kernel_size
         )
 
@@ -303,29 +302,32 @@ class FilterBankWaveletTransform:
         self.synthesis_filters = build_synthesis_filters(
             self.analysis_filters,
             self.j_values,
-            use_multi_channel=self.use_multi_channel_dual
+            use_multi_channel=self.use_multi_channel_dual,
+            dt=self.dt
         )
 
     def forward_transform(self):
         """
-        For each j, convolve data with the analysis filter => shape (N, num_j).
+        For each j, convolve data with analysis filter => shape (N, num_j).
         Multiply by sqrt(dt).
         """
         N = len(self.data)
         num_j = len(self.j_values)
         W = np.zeros((N, num_j), dtype=complex)
+
         scale_forward = np.sqrt(self.dt)
 
         for idx, j_val in enumerate(self.j_values):
             h_j = self.analysis_filters[j_val]
             conv_out = scipy.signal.fftconvolve(self.data, h_j, mode='same')
             W[:, idx] = scale_forward * conv_out
+
         return W
 
     def inverse_transform(self, W):
         """
-        data_approx = sum_j [1/sqrt(dt) * conv(W[:,j], g_j)].
-        If zero_pad>0, remove the padding at the end.
+        data_approx = sum_j [ (1/sqrt(dt)) * conv(W[:,j], g_j ) ].
+        Remove padding if zero_pad>0
         """
         N = len(self.data)
         data_rec = np.zeros(N, dtype=complex)
@@ -342,9 +344,7 @@ class FilterBankWaveletTransform:
         return data_rec.real
 
     def run_full_transform(self):
-        """
-        Convenience: forward then inverse.
-        """
+        """Convenience method => forward + inverse."""
         W = self.forward_transform()
         data_approx = self.inverse_transform(W)
         return W, data_approx

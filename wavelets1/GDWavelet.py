@@ -97,15 +97,16 @@ class GridWaveletTransform:
 
         # Calculate optimal parameters if None
         if self.b is None:
-            # Cutoff time is 1 / 5 of the window period
-            self.b = (data.shape[-1] / 5 / self.fs) / self.wavelet.cutoff_time()
+            # Cutoff time is 1 / 10 of the window period
+            self.b = (data.shape[-1] / 10 / self.fs) / self.wavelet.cutoff_time()
 
         if self.q is None: # todo calculate q and B based on window size
-            self.q = 2*self.b
+            self.q = 8*self.b
 
         if self.M is None:
             # 8 channels times the number of octaves from lowest frequency to Nyquist
-            self.M = 8*int(np.log2((self.fs/2)/(1/self.b)))
+            self.M = int(self.q*(self.fs/2 * wavelet.cutoff_time() - 1/self.b))
+            #8*int(np.log2((self.fs/2)/(1/self.b)))
 
         if self.Mc is None:
             self.Mc = 1
@@ -114,10 +115,12 @@ class GridWaveletTransform:
             self.xi_1 = (self.fs * self.q) / self.Mc / 2
 
 
-        # Calculate time vector, translations, and scale channels
-        self.time = np.arange(0, data.shape[-1] / self.fs, 1 / self.fs)
+        # Calculate padded data, time vector, translations, and scale channels
+        self.data = np.pad(self.data, self.data.shape[0]//2, mode='symmetric')
+        self.data *= scipy.signal.windows.hann(self.data.shape[0])
+        self.time = np.arange(0, self.data.shape[-1] / self.fs, 1 / self.fs)
         self.l_channels = np.arange(self.data.shape[-1] // self.d)
-        self.j_channels = np.arange(-self.Mc, self.M)
+        self.j_channels = np.arange(self.Mc + self.M)
 
         # Calculate quasi-random scale-channel delays
         self.delta_js = self.delay(np.arange(-self.Mc, self.M))
@@ -131,7 +134,7 @@ class GridWaveletTransform:
                 # q is the frequency step factor
                 delta_j = self.delta_js[idx]
 
-                if(j >= -self.q/self.b):
+                if(j >= self.Mc):
                     # Eq 3
                     filterbank = self.wavelet.eq3(self.time, self.fs, l, j, self.d, self.b, self.q, delta_j)
                     coeffs[l, j] = np.sum(self.data * np.conj(filterbank))
@@ -146,17 +149,27 @@ class GridWaveletTransform:
         # Coeffs (l, j)
         result = np.zeros(self.data.shape, dtype=complex)
         for idx, j in enumerate(self.j_channels):
+            delta_j = self.delta_js[idx]
             for l in self.l_channels:
-                if(j >= -self.q/self.b):
+                if(j >= self.Mc):
                     # Eq 3
-                    
                     filterbank = self.wavelet.eq3(self.time, self.fs, l, j, self.d, self.b, self.q, delta_j)
-                    result += coeffs[l, j] * filterbank
+                    normalization = np.sqrt(1 / self.b + j / self.q)
                 else:
                     # Eq 4
                     filterbank = self.wavelet.eq4(self.time,self.fs, l, j, self.d, self.b, self.q, delta_j, self.xi_1)
-                    result += coeffs[l, j] * filterbank
+                    normalization = 1 / np.sqrt(self.b)
+
+                result += coeffs[l, j] * filterbank * np.sqrt(1/self.fs) # * normalization
         
+        # Remove Window
+        hann_window = scipy.signal.windows.hann(result.shape[0])
+        result = np.where(hann_window != 0, result / hann_window, 0)
+
+        # Remove Padding
+        pad_width = result.shape[0] // 4
+        result = result[pad_width:-pad_width]
+
         return result.real
 
     def delay(self, channels):
@@ -293,3 +306,65 @@ print("Percent duration; ", (1/fft_freq_positive[np.argmax(fft_magnitude)]) / du
 
 
 '''
+
+"""
+# TEst reconstruction
+# %%
+alpha = 900                   # Example alpha value
+sample_rate = 50              # 50 Hz sample rate
+duration = 100.0                # Duration in seconds for the plot
+t = np.arange(0, duration, 1/sample_rate)
+N = duration*sample_rate
+data = np.sin(2*np.pi*5*t)
+
+# Instantiate the wavelet
+wavelet = Cauchy(alpha=alpha)
+wt = GridWaveletTransform(data, sample_rate, d = 10, Mc=-4)
+coeffs = wt.forward()
+result = wt.inverse(coeffs)
+
+# Plotting the wavelet
+plt.figure(figsize=(12, 8))
+
+# Real and Imaginary parts
+plt.subplot(2, 1, 1)
+plt.imshow(np.log(np.abs(coeffs.T)), aspect="auto", origin="upper")
+plt.legend()
+plt.grid(True)
+
+def getFFT(result, sample_rate = sample_rate):
+    # Plot fft of wavelet
+    fft_values = np.fft.fft(result)
+    fft_freq = np.fft.fftfreq(len(fft_values), d=1/sample_rate)
+
+    # Only take the positive half of frequencies for plotting
+    half_n = len(fft_values) // 2
+    fft_values_positive = fft_values[:half_n]
+    fft_freq_positive = fft_freq[:half_n]
+    fft_magnitude = (2.0 / N) * np.abs(fft_values_positive)
+    fft_magnitude[0] = fft_magnitude[0] / 2
+    return(fft_freq_positive, fft_magnitude)
+
+plt.subplot(2, 1, 2)
+f1, reconstruction = getFFT(result)
+f2, data_f = getFFT(data)
+plt.plot(f1, reconstruction, label='Reconstruction')
+plt.plot(f2, data_f, label = "original")
+plt.yscale('log')
+
+
+plt.title('FFT of Cauchy Wavelet (α = {})'.format(alpha))
+plt.xlabel('Frequency [Hz]')
+plt.ylabel('Magnitude')
+
+plt.grid(True)
+
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+print("B: ", wt.b)
+print("period: ", 1/fft_freq_positive[np.argmax(fft_magnitude)])
+print("Percent duration; ", (1/fft_freq_positive[np.argmax(fft_magnitude)]) / duration)
+
+"""

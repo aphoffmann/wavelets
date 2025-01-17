@@ -83,60 +83,81 @@ class Cauchy:
         return 1 + 1/denominator
 
 class GridWaveletTransform:
-    def __init__(self, data, fs=1, d=None, b=None, q = None, M=None, Mc=None, xi_1 = None, wavelet=Cauchy()):
+    def __init__(self, data, fs, d=1, b=None, q = None, M=None, Mc=None, xi_1 = None, wavelet=Cauchy()):
         self.data = np.asarray(data, dtype=float)
 
         self.fs = fs             # Sampling frequency
         self.d = d               # Decimation factor (Uniform Decimation)
         self.b = b               # largest scale factor
-        self.q = q               # frequency step factor
+        self.q = q               # frequency step factor NOTE: Larger Q is better
         self.wavelet = wavelet   # Cauchy wavelet
         self.M = M               # Number of wavelet scales
         self.Mc = Mc             # Number of compensation scales for lower frequencies
-        self.xi_1 = xi_1            # Quasi-random phase factor
+        self.xi_1 = xi_1         # Lowpass Filter for compensation channels
+
+        # Calculate optimal parameters if None
+        if self.b is None:
+            # Cutoff time is 1 / 5 of the window period
+            self.b = (data.shape[-1] / 5 / self.fs) / self.wavelet.cutoff_time()
+
+        if self.q is None: # todo calculate q and B based on window size
+            self.q = 2*self.b
+
+        if self.M is None:
+            # 8 channels times the number of octaves from lowest frequency to Nyquist
+            self.M = 8*int(np.log2((self.fs/2)/(1/self.b)))
+
+        if self.Mc is None:
+            self.Mc = 1
+
+        if self.xi_1 is None:
+            self.xi_1 = (self.fs * self.q) / self.Mc / 2
+
 
         # Calculate time vector, translations, and scale channels
-        self.time = np.arange(0, data.shape[-1], 1 / self.fs)
+        self.time = np.arange(0, data.shape[-1] / self.fs, 1 / self.fs)
         self.l_channels = np.arange(self.data.shape[-1] // self.d)
-        self.j_channels = np.arange(self.Mc + self.M)
+        self.j_channels = np.arange(-self.Mc, self.M)
 
         # Calculate quasi-random scale-channel delays
         self.delta_js = self.delay(np.arange(-self.Mc, self.M))
 
-        # TODO: calculate optimal parameters if None
-        if self.q is None:
-            self.q = self.wavelet.cutoff_time()
-
-
     def forward(self):  
         coeffs = np.zeros((self.l_channels.shape[0], self.j_channels.shape[0]), dtype=complex)
-
         for l in self.l_channels:
             for idx, j in enumerate(self.j_channels):
-            
                 # Note: Higher j corresponds to higher frequency
                 # b is the largest scale of interest
                 # q is the frequency step factor
                 delta_j = self.delta_js[idx]
 
-                if(j < -self.q/self.b):
+                if(j >= -self.q/self.b):
                     # Eq 3
-                    filterbank = self.wavelet.eq3()
-                    coeffs[l, j] = np.sum(self.data * filterbank)
-                    pass
+                    filterbank = self.wavelet.eq3(self.time, self.fs, l, j, self.d, self.b, self.q, delta_j)
+                    coeffs[l, j] = np.sum(self.data * np.conj(filterbank))
                 else:
                     # Eq 4
-                    filterbank = self.wavelet.eq4()
-                    coeffs[l, j] = np.sum(self.data * filterbank)
-                    pass
+                    filterbank = self.wavelet.eq4(self.time,self.fs, l, j, self.d, self.b, self.q, delta_j, self.xi_1)
+                    coeffs[l, j] = np.sum(self.data * np.conj(filterbank))
 
         return(coeffs)
 
-
-
-
-    def inverse(self):
-        pass
+    def inverse(self, coeffs):
+        # Coeffs (l, j)
+        result = np.zeros(self.data.shape, dtype=complex)
+        for idx, j in enumerate(self.j_channels):
+            for l in self.l_channels:
+                if(j >= -self.q/self.b):
+                    # Eq 3
+                    
+                    filterbank = self.wavelet.eq3(self.time, self.fs, l, j, self.d, self.b, self.q, delta_j)
+                    result += coeffs[l, j] * filterbank
+                else:
+                    # Eq 4
+                    filterbank = self.wavelet.eq4(self.time,self.fs, l, j, self.d, self.b, self.q, delta_j, self.xi_1)
+                    result += coeffs[l, j] * filterbank
+        
+        return result.real
 
     def delay(self, channels):
         """Calculate the delay vectors for each channel."""
@@ -196,6 +217,79 @@ plt.grid(True)
 plt.tight_layout()
 plt.show()
 
+alpha = 900                   # Example alpha value
+sample_rate = 1              # 50 Hz sample rate
+
+
+duration = 1000.0                # Duration in seconds for the plot
+t = np.arange(0, duration, 1/sample_rate)
+N = duration*sample_rate
+
+
+# Instantiate the wavelet
+wavelet = Cauchy(alpha=alpha)
+
+
+# grid decimated
+l_channels = np.arange(N//sample_rate)
+fs = 50; l = l_channels[5]; j = 0;
+
+
+d = 50; b = N//(sample_rate*5)/wavelet.cutoff_time(); q = 1;
+delta_j = 0
+
+# Evaluate the wavelet
+wavelet_values = wavelet.eq3(t, fs, l, j, d, b, q, delta_j)
+
+
+# Extract real and imaginary parts for plotting
+real_part = np.real(wavelet_values)
+imag_part = np.imag(wavelet_values)
+magnitude = np.abs(wavelet_values)
+phase = np.angle(wavelet_values)
+
+# Plotting the wavelet
+plt.figure(figsize=(12, 8))
+
+# Real and Imaginary parts
+plt.subplot(2, 1, 1)
+plt.plot(t, real_part, label='Real part')
+plt.plot(t, imag_part, label='Imaginary part', linestyle='--')
+plt.title('Cauchy Wavelet (α = {})'.format(alpha))
+plt.xlabel('Time [s]')
+plt.ylabel('Amplitude')
+plt.legend()
+plt.grid(True)
+
+# Plot fft of wavelet
+fft_values = np.fft.fft(wavelet_values)
+fft_freq = np.fft.fftfreq(len(fft_values), d=1/sample_rate)
+
+# Only take the positive half of frequencies for plotting
+half_n = len(fft_values) // 2
+fft_values_positive = fft_values[:half_n]
+fft_freq_positive = fft_freq[:half_n]
+fft_magnitude = (2.0 / N) * np.abs(fft_values_positive)
+fft_magnitude[0] = fft_magnitude[0] / 2
+
+plt.subplot(2, 1, 2)
+plt.plot(fft_freq_positive, fft_magnitude, label='Magnitude')
+plt.xscale('log')
+
+
+plt.title('FFT of Cauchy Wavelet (α = {})'.format(alpha))
+plt.xlabel('Frequency [Hz]')
+plt.ylabel('Magnitude')
+
+plt.grid(True)
+
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+print("B: ", b)
+print("period: ", 1/fft_freq_positive[np.argmax(fft_magnitude)])
+print("Percent duration; ", (1/fft_freq_positive[np.argmax(fft_magnitude)]) / duration)
 
 
 '''

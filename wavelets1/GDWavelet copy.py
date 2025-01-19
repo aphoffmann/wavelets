@@ -14,6 +14,7 @@ import numpy as np
 import scipy.signal
 import matplotlib.pyplot as plt
 from scipy.special import gammaln
+from scipy.signal import fftconvolve
 
 class Cauchy:
     def __init__(self, alpha=300, epsilon=1e-2):
@@ -31,15 +32,14 @@ class Cauchy:
         """Evaluate the analysis wavelet function at time t using NumPy for complex arithmetic."""
         t = np.asarray(t, dtype=np.float64)  # Ensure t is a NumPy array or float
         factor = 1 - 2j * np.pi * t / self.alpha
-        analysis_wavelet = np.power(factor, -1 - self.alpha).conj()
-        analysis_wavelet /= (np.sum(np.abs(analysis_wavelet)**2) * dt)**.5
+        analysis_wavelet = np.power(factor, -1 - self.alpha)
         return analysis_wavelet
 
     def eval_synthesis(self, t):
         """Evaluate the synthesis wavelet function at time t."""
-        return self.norm * self.eval_analysis(t)
+        return self.norm * self.eval_analysis(t).conj()
     
-    def eq3(self, t, fs, l, j, d, b, q, delta_j):
+    def eq3(self, t, j, b, q,):
         """
         Compute Equation 4: ψ_{l,j}(t) for α_j > 0.
         
@@ -47,11 +47,10 @@ class Cauchy:
         ψ_{l,j}(t) = sqrt(1/b + j/q) * ψ((1/b + j/q) * (t - d(l + δ_j))).
         """
         alpha_j = (1.0 / b) + (j / q)
-        shift = d * (l + delta_j) / fs
-        arg = alpha_j * (t - shift)
-        return np.sqrt(alpha_j) * self.eval_analysis(arg) # TODO
-
-    def eq4(self, t, fs, l, j, d, b, q, delta_j, xi_1):
+        arg = alpha_j * t
+        return np.sqrt(alpha_j) * self.eval_analysis(arg)
+    
+    def eq4(self, t, j, b, q, xi_1):
         """
         Compute Equation 5: ψ_{l,j}^{comp}(t) for α_j ≤ 0.
         
@@ -59,29 +58,28 @@ class Cauchy:
         ψ_{l,j}^{comp}(t) = (1/√b) ψ((t - d(l+δ_j)) / b)
                           * exp(2πi ξ₁ * j (t - d(l+δ_j)) / q).
         """
-        shift = d * (l + delta_j)
-        tau = (t - shift) / b / fs
+        tau = t / b 
         base = self.eval_analysis(tau) # TODO
-        phase = np.exp(2j * np.pi * xi_1 * j * (t - shift) / q)
+        phase = np.exp(2j * np.pi * xi_1 * j * (t) / q)
         return (1.0 / np.sqrt(b)) * base * phase
     
-    def eq3_synth(self, t, fs, l, j, d, b, q, delta_j):
+    def eq3_synth(self, t, l, j, d, b, q, delta_j):
         """
         Compute the synthesis counterpart of Equation 4 for ψ_{l,j}(t) using synthesis wavelet.
         Adjusted to use eval_synthesis for reconstruction.
         """
         alpha_j = (1.0 / b) + (j / q)
-        shift = d * (l + delta_j) / fs
+        shift = d * (l+ delta_j)
         arg = alpha_j * (t - shift)
         # Use synthesis wavelet function with appropriate scaling. 
         return np.sqrt(alpha_j) * self.eval_synthesis(arg)
 
-    def eq4_synth(self, t, fs, l, j, d, b, q, delta_j, xi_1):
+    def eq4_synth(self, t, l, j, d, b, q, delta_j, xi_1):
         """
         Compute the synthesis counterpart of Equation 5 for ψ_{l,j}^{comp}(t) using synthesis wavelet.
         """
-        shift = d * (l + delta_j)
-        tau = (t - shift) / b / fs
+        shift = d * (l + delta_j) 
+        tau = (t - shift) / b
         base = self.eval_synthesis(tau)
         phase = np.exp(2j * np.pi * xi_1 * j * (t - shift) / q)
         return (1.0 / np.sqrt(b)) * base * phase
@@ -117,6 +115,7 @@ class GridWaveletTransform:
         self.M = M               # Number of wavelet scales
         self.Mc = Mc             # Number of compensation scales for lower frequencies
         self.xi_1 = xi_1         # Lowpass Filter for compensation channels
+        self.norm = None
 
         # Calculate optimal parameters if None
         self.calcluate_parameters()
@@ -132,17 +131,14 @@ class GridWaveletTransform:
     def calcluate_parameters(self):
         # Calculate optimal parameters if None
         if self.b is None:
-            # Cutoff time is 1 / 10 of the window period
-            lowest_freq = 10*self.fs / self.data.shape[-1]
-            self.b = self.fs / (2 * np.pi * lowest_freq * self.wavelet.cutoff_time())
-            #self.b = (data.shape[-1] / 10 / self.fs) / self.wavelet.cutoff_time()
+            self.b = (self.data.shape[-1] / 10 / self.fs)
 
         if self.q is None: # todo calculate q and B based on window size
             self.q = self.b
 
         if self.M is None:
             # 8 channels times the number of octaves from lowest frequency to Nyquist
-            self.M = int(self.q*(self.fs/2 * self.wavelet.cutoff_time() - 1/self.b))
+            self.M = int(self.q*(self.fs/2 - 1/self.b))
 
         if self.Mc is None:
             self.Mc = 1
@@ -152,45 +148,49 @@ class GridWaveletTransform:
         
         return
 
-
     def forward(self):  
-        coeffs = np.zeros((self.l_channels.shape[0], self.j_channels.shape[0]), dtype=complex)
-        for l in self.l_channels:
-            for idx, j in enumerate(self.j_channels):
-                # Note: Higher j corresponds to higher frequency
-                # b is the largest scale of interest
-                # q is the frequency step factor
-                delta_j = self.delta_js[idx]
+        coeffs = np.zeros((self.j_channels.shape[0], self.data.shape[0]), dtype=complex)
+        time = self.time - np.mean(self.time)
+        for idx, j in enumerate(self.j_channels):
+            # Note: Higher j corresponds to higher frequency
+            # b is the largest scale of interest
+            # q is the frequency step factor
+            delta_j = self.delta_js[idx]
 
-                if(j >= self.Mc):
-                    # Eq 3
-                    filterbank = self.wavelet.eq3(self.time, self.fs, l, j, self.d, self.b, self.q, delta_j)
-                else:
-                    # Eq 4
-                    filterbank = self.wavelet.eq4(self.time,self.fs, l, j, self.d, self.b, self.q, delta_j, self.xi_1)
-                
-                coeffs[l, j] = np.sum(self.data * np.conj(filterbank)) / self.fs
+            if(j >= self.Mc):
+                # Eq 3
+                filterbank = self.wavelet.eq3(time, j, self.b, self.q)
+            else:
+                # Eq 4
+                filterbank = self.wavelet.eq4(time, j,  self.b, self.q, self.xi_1)
 
+            coeffs[j] = np.array(fftconvolve(self.data, filterbank, mode='same')) 
+            
         return(coeffs)
 
     def inverse(self, coeffs):
-        # Coeffs (l, j)
+        # Coeffs (j, l)
+        time = self.time - np.mean(self.time)
         result = np.zeros(self.data.shape, dtype=complex)
+
+        if(self.norm is None):
+            self.norm = np.sum(np.abs(self.wavelet.eq3(time, self.j_channels[-1],  self.b, self.q))**2)
+            
+
         for idx, j in enumerate(self.j_channels):
             delta_j = self.delta_js[idx]
-            
-            for l in self.l_channels:
-                if(j >= self.Mc):
-                    # Eq 3
-                    filterbank = self.wavelet.eq3_synth(self.time, self.fs, l, j, self.d, self.b, self.q, delta_j)
-                else:
-                    # Eq 4
-                    filterbank = self.wavelet.eq4_synth(self.time,self.fs, l, j, self.d, self.b, self.q, delta_j, self.xi_1)
+            if(j >= self.Mc):
+                # Eq 3
+                filterbank = self.wavelet.eq3(time, j, self.b, self.q)
+                sj = 1 / (1/self.b + j / self.q)
+            else:
+                # Eq 4
+                filterbank = self.wavelet.eq4(time, j,  self.b, self.q, self.xi_1)
+                sj = 1 / self.b
 
+            result += np.array(fftconvolve(coeffs[j], filterbank, mode='same')) / self.q * np.sqrt( 1/self.fs) / self.norm
 
-                result += coeffs[l, j] * filterbank / self.fs #/ self.wavelet.norm
         
-
         return result.real
 
     def delay(self, channels):

@@ -16,6 +16,55 @@ import matplotlib.pyplot as plt
 from scipy.special import gammaln
 from scipy.signal import fftconvolve
 
+
+class Morlet:
+    def __init__(self, w0=6):
+        """w0 is the nondimensional frequency constant. If this is
+        set too low then the wavelet does not sample very well: a
+        value over 5 should be ok; Terrence and Compo set it to 6.
+        """
+        self.w0 = w0
+        if w0 == 6:
+            # value of C_d from TC98
+            self.C_d = 0.776
+
+    def eval_analysis(self, t):
+        w = self.w0
+
+        x = t
+
+        output = np.exp(1j * w * x)
+        output -= np.exp(-0.5 * (w ** 2))
+        output *= np.exp(-0.5 * (x ** 2)) * np.pi ** (-0.25)
+
+        return output
+    
+    def eq3(self, t, j, b, q,):
+        """
+        Compute Equation 4: ψ_{l,j}(t) for α_j > 0.
+        
+        Equation 4:
+        ψ_{l,j}(t) = sqrt(1/b + j/q) * ψ((1/b + j/q) * (t - d(l + δ_j))).
+        """
+        alpha_j = (1.0 / b) + (j / q)
+        arg = alpha_j * t
+        return np.sqrt(alpha_j) * self.eval_analysis(arg)
+    
+    def eq4(self, t, j, b, q, xi_1):
+        """
+        Compute Equation 5: ψ_{l,j}^{comp}(t) for α_j ≤ 0.
+        
+        Equation 5:
+        ψ_{l,j}^{comp}(t) = (1/√b) ψ((t - d(l+δ_j)) / b)
+                          * exp(2πi ξ₁ * j (t - d(l+δ_j)) / q).
+        """
+        tau = t / b 
+        base = self.eval_analysis(tau) # TODO
+        phase = np.exp(2j * np.pi * xi_1 * j * (t) / q)
+        return (1.0 / np.sqrt(b)) * base * phase
+
+
+
 class Cauchy:
     def __init__(self, alpha=300, epsilon=1e-2):
         self.alpha = float(alpha)
@@ -115,7 +164,7 @@ class GridWaveletTransform:
         self.M = M               # Number of wavelet scales
         self.Mc = Mc             # Number of compensation scales for lower frequencies
         self.xi_1 = xi_1         # Lowpass Filter for compensation channels
-        self.norm = None
+
 
         # Calculate optimal parameters if None
         self.calcluate_parameters()
@@ -123,10 +172,7 @@ class GridWaveletTransform:
         # Calculate time vector, translations, and scale channels
         self.time = np.arange(0, self.data.shape[-1] / self.fs, 1 / self.fs)
         self.l_channels = np.arange(self.data.shape[-1] // self.d)
-        self.j_channels = np.arange(self.Mc + self.M)
-
-        # Calculate quasi-random scale-channel delays
-        self.delta_js = self.delay(np.arange(-self.Mc, self.M))
+        self.j_channels = np.arange(-self.Mc, self.M)
 
     def calcluate_parameters(self):
         # Calculate optimal parameters if None
@@ -141,10 +187,10 @@ class GridWaveletTransform:
             self.M = int(self.q*(self.fs/2 - 1/self.b))
 
         if self.Mc is None:
-            self.Mc = 1
+            self.Mc = int(self.q/self.b)
 
         if self.xi_1 is None:
-            self.xi_1 = (self.fs * self.q) / self.Mc / 2
+            self.xi_1 = (self.fs * self.q) / self.M / 2
         
         return
 
@@ -155,9 +201,7 @@ class GridWaveletTransform:
             # Note: Higher j corresponds to higher frequency
             # b is the largest scale of interest
             # q is the frequency step factor
-            delta_j = self.delta_js[idx]
-
-            if(j >= self.Mc):
+            if(j/self.q + 1/self.b > 0):
                 # Eq 3
                 filterbank = self.wavelet.eq3(time, j, self.b, self.q)
             else:
@@ -168,42 +212,67 @@ class GridWaveletTransform:
             
         return(coeffs)
 
-    def inverse(self, coeffs):
+    """    def inverse(self, coeffs):
         # Coeffs (j, l)
         time = self.time - np.mean(self.time)
         result = np.zeros(self.data.shape, dtype=complex)
 
-        if(self.norm is None):
-            self.norm = np.sum(np.abs(self.wavelet.eq3(time, self.j_channels[-1],  self.b, self.q))**2)
-            
-
         for idx, j in enumerate(self.j_channels):
-            delta_j = self.delta_js[idx]
-            if(j >= self.Mc):
+            if(j/self.q + 1/self.b > 0):
                 # Eq 3
-                filterbank = self.wavelet.eq3(time, j, self.b, self.q)
                 sj = 1 / (1/self.b + j / self.q)
             else:
                 # Eq 4
-                filterbank = self.wavelet.eq4(time, j,  self.b, self.q, self.xi_1)
                 sj = 1 / self.b
 
-            result += np.array(fftconvolve(coeffs[j], filterbank, mode='same')) / self.q * np.sqrt( 1/self.fs) / self.norm
+            result += coeffs[j].real / self.q * np.sqrt( 1/self.fs) / np.sqrt(sj)
 
         
-        return result.real
-
-    def delay(self, channels):
-        """Calculate the delay vectors for each channel."""
-        alpha = 1 - 2 / (1 + np.sqrt(5))  # 1 - 1/(golden ratio0
-        return(np.mod(channels * alpha + 0.5, 1) - 0.5)
-        
-
-    def framebounds(self):
-        pass
-
+        return result.real"""
     
+    def inverse(self, coeffs):
+        """
+        Inverse transform of the linear-frequency-spaced wavelet representation,
+        with compensation channels for alpha_j <= 0.
 
+        Args:
+            coeffs (ndarray): Wavelet coefficients, shape = (num_j_channels, num_samples)
+
+        Returns:
+            np.ndarray: Reconstructed signal (real part).
+        """
+        result = np.zeros_like(self.data, dtype=complex)
+
+        # Loop over all j-channels (including negative j for compensation)
+        for idx, j in enumerate(self.j_channels):
+            # Compute alpha_j = (1/b) + (j/q).
+            alpha_j = (1.0 / self.b) + (float(j) / self.q)
+
+            # "Measure" factor for summation over j:
+            delta_alpha = 1.0 / self.q
+
+            if alpha_j > 0:
+                # ---------------------------------------------------------------
+                # Equation (3) wavelet was used in the forward transform:
+                #   psi_{l,j}(t) = sqrt(alpha_j) * psi(alpha_j * t).
+                # The inverse typically needs a factor 1/sqrt(alpha_j).
+                # ---------------------------------------------------------------
+                factor = delta_alpha * np.sqrt(1.0 / self.fs) * (1.0 / np.sqrt(alpha_j))
+
+            else:
+                # ---------------------------------------------------------------
+                # Equation (4) wavelet ("compensation channel") was used:
+                #   psi_{l,j}^{comp}(t) = (1/sqrt(b)) * psi((t)/b) * exp(...).
+                # The inverse typically needs a factor sqrt(b).
+                # ---------------------------------------------------------------
+                factor = delta_alpha * np.sqrt(1.0 / self.fs) * np.sqrt(self.b)
+
+            # Accumulate into the reconstructed signal
+            # (If coefficients are complex, you might keep the complex part,
+            # but here we are taking .real for final output.)
+            result += coeffs[j].real * factor
+
+        return result.real
 
     
 ####################################### Test Plots

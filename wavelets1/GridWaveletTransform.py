@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 from scipy.special import gammaln
 from scipy import signal
 
+__all__ = ["Morlet", "Cauchy", "GridWaveletTransform"]
+
 class Morlet:
     def __init__(self, w0=6):
         """w0 is the nondimensional frequency constant. If this is
@@ -162,8 +164,15 @@ class GridWaveletTransform:
         self.j_channels = np.arange(-self.Mc, self.M)
         self.delays = self._delay(self.j_channels)
 
+
+
         # Precompute the wavelets in frequency domain, Wfreq[j, :], shape = (#channels, N).
         self.Wfreq = self._build_wavelets_FD()
+
+            # Compute the phase shift for time correction  
+        self.freqs = np.fft.fftfreq(self.N)
+        self.phase_shift = np.exp(-1j * 2 * np.pi * self.freqs * (self.N / 2))
+        self.Wfreq *= self.phase_shift[np.newaxis, :]
 
         # Frame operator S(w) = sum_j |W_j(w)|^2
         # shape = (N,)
@@ -263,6 +272,73 @@ class GridWaveletTransform:
             xhat_time = xhat_time[self.pad_width:-self.pad_width]
 
         return xhat_time
+    
+    def overlap_save_conv(self, x, h, block_size=2048):
+        """
+        Perform linear convolution of x with h using the Overlap-Save method.
+
+        Parameters
+        ----------
+        x : 1D array
+            The input signal
+        h : 1D array
+            The filter (wavelet in your case)
+        block_size : int
+            The size of each processing block. Must be >= len(h).
+
+        Returns
+        -------
+        y : 1D array
+            The linear convolution result, length = len(x) + len(h) - 1
+            (unless you choose to trim it to match x's length).
+        """
+        L = len(h)
+        if block_size < L:
+            raise ValueError("block_size must be at least as large as len(h).")
+
+        # We'll zero-pad h to length block_size
+        H = np.fft.fft(h, n=block_size)
+
+        # The output length for linear conv is len(x)+len(h)-1
+        out_len = len(x) + L - 1
+        y = np.zeros(out_len, dtype=np.complex128)
+
+        # Number of new samples we can process each block
+        step_size = block_size - (L - 1)
+
+        # We'll maintain a buffer of length block_size,
+        # reading step_size new samples each time.
+        x_pos = 0
+
+        # We can keep processing until we've consumed all of x
+        while x_pos < len(x):
+            # Copy block_size samples into a temp array (with overlap)
+            block = np.zeros(block_size, dtype=np.complex128)
+
+            # The new portion is x[x_pos : x_pos+step_size],
+            # but we also need the (L-1) overlap from the end of the last block.
+            end_pos = min(x_pos + step_size, len(x))
+            block_data = x[x_pos:end_pos]
+            block[0:len(block_data)] = block_data
+
+            # FFT
+            X_block = np.fft.fft(block, n=block_size)
+            # Multiply in freq domain
+            Y_block = X_block * H
+            # IFFT
+            y_block = np.fft.ifft(Y_block)
+
+            # Output starts after the first (L-1) corrupted samples
+            # because overlap-save discards those
+            start_out = x_pos
+            end_out   = start_out + step_size
+            y[start_out:end_out] += y_block[L-1 : L-1 + step_size]
+
+            # Advance
+            x_pos += step_size
+
+        return y
+
 
 ####################################### Test Plots
 '''

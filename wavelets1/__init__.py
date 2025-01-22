@@ -1,1 +1,1 @@
-from .GridWaveletTransform import GridWaveletTransform
+from .GridWaveletTransform import GridWaveletTransform, Morlet, Cauchy

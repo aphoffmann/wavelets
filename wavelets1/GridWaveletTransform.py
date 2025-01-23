@@ -151,7 +151,7 @@ class GridWaveletTransform:
             self.pad_width = data.shape[-1]
             self.data = np.pad(self.data, self.pad_width, mode=pad_method)
             self.N = self.data.shape[-1]
-            self.data *= signal.windows.tukey(self.N, alpha=0.3)
+            self.data *= signal.windows.tukey(self.N, alpha=.5)
 
          # fill default parameters
         self._init_params(b, q, M, Mc, xi_1)
@@ -273,73 +273,50 @@ class GridWaveletTransform:
 
         return xhat_time
     
-    def overlap_save_conv(self, x, h, block_size=2048):
+
+    def plot_coeff_power(self, coeffs, cmap='viridis', vmin=None, vmax=None, 
+                        y_tick_steps=5, figsize=(10, 6)):
         """
-        Perform linear convolution of x with h using the Overlap-Save method.
+        Plot the power of the wavelet coefficients.
 
-        Parameters
-        ----------
-        x : 1D array
-            The input signal
-        h : 1D array
-            The filter (wavelet in your case)
-        block_size : int
-            The size of each processing block. Must be >= len(h).
-
-        Returns
-        -------
-        y : 1D array
-            The linear convolution result, length = len(x) + len(h) - 1
-            (unless you choose to trim it to match x's length).
+        Parameters:
+        - coeffs: 2D numpy array of shape (#channels, N) containing the wavelet coefficients.
+        - cmap: Colormap for the plot.
+        - vmin, vmax: Minimum and maximum values for the colormap scaling.
+        - y_tick_steps: Number of frequency ticks to display on the y-axis.
+        - figsize: Size of the figure.
         """
-        L = len(h)
-        if block_size < L:
-            raise ValueError("block_size must be at least as large as len(h).")
+        power = np.abs(coeffs) ** 2  # Power of coefficients
 
-        # We'll zero-pad h to length block_size
-        H = np.fft.fft(h, n=block_size)
+        # Calculate frequency for each channel
+        alpha_j = (1.0 / self.b) + (self.j_channels / self.q)
+        frequency_j = alpha_j / (2 * np.pi)  # Convert scale to frequency in Hz
 
-        # The output length for linear conv is len(x)+len(h)-1
-        out_len = len(x) + L - 1
-        y = np.zeros(out_len, dtype=np.complex128)
+        # Sort frequencies and corresponding power for better visualization
+        sorted_indices = np.argsort(frequency_j)
+        frequency_j_sorted = frequency_j[sorted_indices]
+        power_sorted = power[sorted_indices, :]
 
-        # Number of new samples we can process each block
-        step_size = block_size - (L - 1)
+        plt.figure(figsize=figsize)
+        extent = [self.time[0], self.time[-1], frequency_j_sorted[0], frequency_j_sorted[-1]]
 
-        # We'll maintain a buffer of length block_size,
-        # reading step_size new samples each time.
-        x_pos = 0
+        im = plt.imshow(np.log(power_sorted), aspect='auto', origin='lower', extent=extent, 
+                        cmap=cmap, vmin=vmin, vmax=vmax)
 
-        # We can keep processing until we've consumed all of x
-        while x_pos < len(x):
-            # Copy block_size samples into a temp array (with overlap)
-            block = np.zeros(block_size, dtype=np.complex128)
+        plt.colorbar(im, label='Power')
 
-            # The new portion is x[x_pos : x_pos+step_size],
-            # but we also need the (L-1) overlap from the end of the last block.
-            end_pos = min(x_pos + step_size, len(x))
-            block_data = x[x_pos:end_pos]
-            block[0:len(block_data)] = block_data
+        plt.xlabel('Time [s]')
+        plt.ylabel('Frequency [Hz]')
 
-            # FFT
-            X_block = np.fft.fft(block, n=block_size)
-            # Multiply in freq domain
-            Y_block = X_block * H
-            # IFFT
-            y_block = np.fft.ifft(Y_block)
+        # Set y-axis ticks
+        y_min, y_max = frequency_j_sorted[0], frequency_j_sorted[-1]
+        y_ticks = np.linspace(y_min, y_max, y_tick_steps)
+        plt.yticks(y_ticks, [f"{freq:.2f}" for freq in y_ticks])
 
-            # Output starts after the first (L-1) corrupted samples
-            # because overlap-save discards those
-            start_out = x_pos
-            end_out   = start_out + step_size
-            y[start_out:end_out] += y_block[L-1 : L-1 + step_size]
-
-            # Advance
-            x_pos += step_size
-
-        return y
-
-
+        plt.title('Wavelet Coefficients Power')
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+        plt.tight_layout()
+        plt.show()  
 ####################################### Test Plots
 '''
 alpha = 900                   # Example alpha value
